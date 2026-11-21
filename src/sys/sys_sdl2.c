@@ -104,6 +104,12 @@ void sys_audio_callback_S8(void *userdata, u8 *stream, s32 len);
 #pragma mark - SDL2 System init
 // ============================================================================
 
+// Software cursor (see sys_dirty_mouse / sys_render)
+static SDL_mutex   *soft_cursor_lock;
+static u32         *soft_cursor_pixels;
+static int          soft_cursor_w, soft_cursor_h, soft_cursor_dirty;
+static SDL_Texture *soft_cursor_tex;
+
 u32 sys_ticks(void) { return SDL_GetTicks(); }
 void sys_delay(u32 ms) { SDL_Delay(ms); }
 u8 *sys_get_framebuffer(int index) { (void)index; return NULL; }  // VM mallocs the render buffers
@@ -256,6 +262,7 @@ void sys_init(sPlatform *pl, int fullscreen, int mutesound)
     
     SDL_PauseAudioDevice(audio_id, mutesound);
     
+    soft_cursor_lock = SDL_CreateMutex();
     render_sem = SDL_CreateSemaphore(1);
     if (render_sem == NULL)
     {
@@ -343,6 +350,17 @@ void sys_sleep_until_music_stops(void)
 #pragma mark - SDL2 Main system loop
 // ============================================================================
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+static void sys_em_tick(void)
+{
+    if (!alis.state || failure) { emscripten_cancel_main_loop(); return; }
+    sys_poll_event();
+}
+#endif
+
+int sys_zqsd_remap(SDL_Keysym *ks, int down);
+
 u8 sys_start(void)
 {
 
@@ -358,6 +376,10 @@ u8 sys_start(void)
         return 1;
     }
     
+#ifdef __EMSCRIPTEN__
+    // Browser: the main thread must never block; the VM runs in a worker.
+    emscripten_set_main_loop(sys_em_tick, 0, 1);
+#endif
     while (alis.state && !failure)
     {
         // wait so image is drawn and keyboard is polled at 120 fps
@@ -396,9 +418,73 @@ void sys_poll_event(void)
     mouse.x = newx;
     mouse.y = (lh > 0) ? newy * (float)height / (float)lh : newy / aspect_ratio;
 
+#if !defined(__EMSCRIPTEN__) && !defined(NDEBUG)
+    // Test hook: ALIS_CLICKS="t:x,y;t:x,y" left-clicks at game pixel (x,y), t seconds after start.
+    {
+        static int n = -1, k = 0; static float ct[32]; static int cx[32], cy[32]; static Uint32 t0, held;
+        if (n < 0)
+        {
+            n = 0; t0 = SDL_GetTicks();
+            const char *e = getenv("ALIS_CLICKS");
+            while (e && *e && n < 32 && sscanf(e, "%f:%d,%d", &ct[n], &cx[n], &cy[n]) == 3)
+            {
+                n++; e = strchr(e, ';'); if (e) e++;
+            }
+        }
+        Uint32 now = SDL_GetTicks() - t0;
+        static Uint32 stay;                                  // keep the cursor on the last click for 0.5 s
+        if (held && now > held) { mouse.lb = 0; held = 0; }
+        if (k > 0 && now < stay) { mouse.x = cx[k - 1]; mouse.y = cy[k - 1]; }
+        else if (k < n) { mouse.x = cx[k]; mouse.y = cy[k]; }
+        if (k < n && now >= (Uint32)(ct[k] * 1000))
+        {
+            mouse.lb = 1; mouse.lb_clicked = 1; held = now + 150; stay = now + 500;
+            fprintf(stderr, "\n### TEST CLICK %d at %d,%d\n", k, cx[k], cy[k]);
+            k++;
+        }
+    }
+#endif
+
+#if !defined(__EMSCRIPTEN__) && !defined(NDEBUG)
+    extern int sys_test_held_sc;
+    // Test hooks: ALIS_POKE="t:off=val,off=val;..." writes MAIN bytes (offsets from basemain, hex) at
+    // t seconds; ALIS_KEYS="t:name;..." presses an SDL key (SDL_GetKeyFromName) for 300 ms.
+    {
+        static int np = -1, kp = 0, nk = -1, kk = 0; static float pt[16], kt[64]; static char pv[16][96]; static SDL_Keycode ks[64];
+        static Uint32 t0, kup; static SDL_Keycode kdown;
+        if (np < 0)
+        {
+            np = nk = 0; t0 = SDL_GetTicks();
+            const char *e = getenv("ALIS_POKE");
+            while (e && *e && np < 16) { int n = 0; if (sscanf(e, "%f:%95[^;]%n", &pt[np], pv[np], &n) < 2) break; np++; e += n; if (*e == ';') e++; }
+            e = getenv("ALIS_KEYS");
+            while (e && *e && nk < 64) { char nm[32]; int n = 0; if (sscanf(e, "%f:%31[^;]%n", &kt[nk], nm, &n) < 2) break; ks[nk++] = SDL_GetKeyFromName(nm); e += n; if (*e == ';') e++; }
+        }
+        Uint32 now = SDL_GetTicks() - t0;
+        if (kp < np && now >= (Uint32)(pt[kp] * 1000))
+        {
+            char *q = pv[kp]; unsigned off, val; int n;
+            while (sscanf(q, "%x=%x%n", &off, &val, &n) == 2) { xwrite8(alis.basemain + off, (u8)val); q += n; if (*q == ',') q++; }
+            fprintf(stderr, "\n### TEST POKE %s at %u ms\n", pv[kp], now); kp++;
+        }
+        if (kdown && now >= kup)
+        {
+            SDL_Event ev = { 0 }; ev.type = SDL_KEYUP; ev.key.keysym.sym = kdown; ev.key.keysym.scancode = SDL_GetScancodeFromKey(kdown); SDL_PushEvent(&ev); kdown = 0; sys_test_held_sc = -1;
+        }
+        else if (!kdown && kk < nk && now >= (Uint32)(kt[kk] * 1000))
+        {
+            SDL_Event ev = { 0 }; ev.type = SDL_KEYDOWN; ev.key.keysym.sym = ks[kk]; ev.key.keysym.scancode = SDL_GetScancodeFromKey(ks[kk]); SDL_PushEvent(&ev);
+            kdown = ks[kk]; kup = now + 300; sys_test_held_sc = ev.key.keysym.scancode; fprintf(stderr, "\n### TEST KEY %s at %u ms\n", SDL_GetKeyName(ks[kk]), now); kk++;
+        }
+    }
+#endif
+
     // Drain the event queue; quick clicks latch in mouse.lb_clicked / rb_clicked.
     while (SDL_PollEvent(&event))
     {
+        if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
+            sys_zqsd_remap(&event.key.keysym, event.type == SDL_KEYDOWN);
+
         switch (event.type)
         {
 
@@ -451,6 +537,7 @@ void sys_poll_event(void)
                         ALIS_DEBUG(EDebugSystem, "INTERRUPT: User debug label.\n");
                         break;
 
+#ifndef __EMSCRIPTEN__                  // F9 = character IV attack in Ishar 3 (web)
                     case SDLK_F9:
                     {
                         static int wav_recording = 0;
@@ -467,6 +554,7 @@ void sys_poll_event(void)
 
                         break;
                     }
+#endif
 
                     case SDLK_F11:
                         alis.state = eAlisStateSave;
@@ -561,7 +649,12 @@ void sys_poll_event(void)
 void sys_render(pixelbuf_t buffer)
 {
     dirty_len = 0;
+#ifdef __EMSCRIPTEN__
+    if (SDL_SemTryWait(render_sem) != 0)
+        return;   // the VM is drawing: skip this frame rather than block the browser
+#else
     SDL_SemWait(render_sem);
+#endif
 
     // v6 runtime resolution switch
     if (buffer.w != width || buffer.h != height)
@@ -805,6 +898,35 @@ void sys_render(pixelbuf_t buffer)
     // clear & render
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, NULL, NULL);
+
+    // software cursor, in logical coordinates (width x height*aspect)
+    SDL_LockMutex(soft_cursor_lock);
+    if (soft_cursor_dirty)
+    {
+        soft_cursor_dirty = 0;
+        if (soft_cursor_tex)
+            SDL_DestroyTexture(soft_cursor_tex);
+        soft_cursor_tex = NULL;
+        if (soft_cursor_pixels)
+        {
+            soft_cursor_tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, soft_cursor_w, soft_cursor_h);
+            if (soft_cursor_tex)
+            {
+                SDL_UpdateTexture(soft_cursor_tex, NULL, soft_cursor_pixels, soft_cursor_w * 4);
+                SDL_SetTextureBlendMode(soft_cursor_tex, SDL_BLENDMODE_BLEND);
+            }
+        }
+    }
+    SDL_UnlockMutex(soft_cursor_lock);
+    if (soft_cursor_tex && mouse.enabled && alis.platform.version < 60)
+    {
+        int lw = 0, lh = 0;
+        SDL_RenderGetLogicalSize(renderer, &lw, &lh);
+        float ay = (lh > 0 && height > 0) ? (float)lh / (float)height : 1.0f;
+        SDL_Rect dst = { mouse.x, (int)(mouse.y * ay), soft_cursor_w, (int)(soft_cursor_h * ay + 0.5f) };
+        SDL_RenderCopy(renderer, soft_cursor_tex, NULL, &dst);
+    }
+
     SDL_RenderPresent(renderer);
     
     SDL_SemPost(render_sem);
@@ -870,6 +992,7 @@ void sys_mouse_uncopy(void) {}
 void sys_mouse_draw(void)   {}
 void sys_flip_wait(void)    {}
 
+
 void sys_dirty_mouse(void)
 {
 
@@ -882,6 +1005,11 @@ void sys_dirty_mouse(void)
 
     if (alis.desmouse == NULL)
     {
+        SDL_LockMutex(soft_cursor_lock);
+        free(soft_cursor_pixels);
+        soft_cursor_pixels = NULL;
+        soft_cursor_dirty = 1;
+        SDL_UnlockMutex(soft_cursor_lock);
         SDL_ShowCursor(mouse.enabled);
         return;
     }
@@ -995,38 +1123,40 @@ void sys_dirty_mouse(void)
         }
     };
     
-    SDL_Surface *surface = SDL_CreateRGBSurfaceFrom(pixels, width, height, 32, width * 4, 0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000);
-    if (!surface)
-    {
-        printf("Failed to create mouse surface: %s\n", SDL_GetError());
-        return;
-    }
-    
-    SDL_Surface *scaledSurface = SDL_CreateRGBSurface(0, width * scale_x, height * scale_y, surface->format->BitsPerPixel, surface->format->Rmask, surface->format->Gmask, surface->format->Bmask, surface->format->Amask);
-    if (SDL_BlitScaled(surface, NULL, scaledSurface, NULL) < 0)
-    {
-        printf("Failed to scale mouse cursor: %s\n", SDL_GetError());
-
-        SDL_FreeSurface(scaledSurface);
-        scaledSurface = NULL;
-    }
-    else
-    {
-        SDL_FreeSurface(surface);
-
-        surface = scaledSurface;
-        width = surface->w;
-        height = surface->h;
-    }
-    
-    cursor = SDL_CreateColorCursor(surface, 0, 0);
-    
-    SDL_FreeSurface(surface);
-    
-    SDL_SetCursor(cursor);
-    SDL_ShowCursor(mouse.enabled);
+    // Software cursor: the image is blended into the render (sys_render) at its native size,
+    // instead of an enlarged system cursor that macOS enlarges further (accessibility).
+    SDL_LockMutex(soft_cursor_lock);
+    free(soft_cursor_pixels);
+    soft_cursor_pixels = pixels;
+    pixels = NULL;
+    soft_cursor_w = width;
+    soft_cursor_h = height;
+    soft_cursor_dirty = 1;
+    SDL_UnlockMutex(soft_cursor_lock);
+    SDL_ShowCursor(SDL_DISABLE);
 
     free(pixels);
 }
 
+#endif
+
+#ifdef __EMSCRIPTEN__
+// --- VM memory access from the page (minimap) --------------------------------------------
+EMSCRIPTEN_KEEPALIVE u8 *em_vm_mem(void) { return alis.mem; }
+EMSCRIPTEN_KEEPALIVE u32 em_vm_finmem(void) { return alis.finmem; }
+EMSCRIPTEN_KEEPALIVE u32 em_vm_basemain(void) { return (u32)alis.basemain; }
+u32 sys_zqsd_main_age(void);
+// 1 if the player has control (MAIN.IO reads the keyboard): the minimap only reveals then
+int sys_io_menu_open(void);
+EMSCRIPTEN_KEEPALIVE int em_text_input(void) { return sys_io_menu_open(); }   // text input in progress (io.IO, textin.IO)
+EMSCRIPTEN_KEEPALIVE int em_player_control(void) { return sys_zqsd_main_age() < 500 && !alis.automode && !sys_io_menu_open(); }
+EMSCRIPTEN_KEEPALIVE int em_automode(void) { return alis.automode; }
+// i-th live script: name (or NULL); *vram receives vram_org
+EMSCRIPTEN_KEEPALIVE const char *em_vm_script(int i, u32 *vram)
+{
+    if (i < 0 || i >= MAX_SCRIPTS || !alis.live_scripts[i] || !alis.live_scripts[i]->name)
+        return NULL;
+    *vram = alis.live_scripts[i]->vram_org;
+    return alis.live_scripts[i]->name;
+}
 #endif

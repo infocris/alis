@@ -23,6 +23,7 @@
 #include "config.h"
 #include "image.h"
 #include "unpack.h"
+#include "patches.h"
 #include "sys/sys.h"
 
 #include <stdlib.h>
@@ -186,6 +187,30 @@ int main(int argc, char *argv[])
                 disalis ^= 1;
             }
 #endif
+            else if (strncmp(cmd, "--lang=", 7) == 0)
+            {
+                static const char *langs[] = { "fr", "en", "de", "es" };
+                for (int l = 0; l < 4; l++)
+                    if (strcmp(cmd + 7, langs[l]) == 0)
+                        opt_lang = l;
+            }
+            else if (strncmp(cmd, "--load=", 7) == 0 && cmd[7])
+            {
+                strncpy(opt_load, cmd + 7, sizeof(opt_load) - 1);
+                boot_load_state = 1;
+            }
+            else if (strcmp(cmd, "--skip-intro") == 0)
+            {
+                opt_skip_intro = 1;
+            }
+            else if (strcmp(cmd, "--no-manual-check") == 0)
+            {
+                opt_no_manual_check = 1;
+            }
+            else if (strcmp(cmd, "--passersby") == 0)
+            {
+                opt_passersby = 1;
+            }
             else if (strcmp(cmd, "-u") == 0)
             {
                 unpackmode = 1;

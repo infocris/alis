@@ -25,3 +25,11 @@
 #include "config.h"
 
 void script_fix(const char *name, u8 *data, u32 data_sz);
+extern s32 opt_lang;
+extern s32 opt_skip_intro;
+extern s32 opt_passersby;        // Ishar 3: --passersby starts the town passersby (CD release)
+extern s32 opt_no_manual_check;   // Ishar 3: --no-manual-check accepts any answer at the gates
+void manual_check_hook(void);     // runs before each instruction while --no-manual-check is on
+extern char opt_load[16];      // Ishar 3: --load=a3 loads that save from the title screen
+extern s32 boot_load_state;    // 1 = waiting for the title menu, 2 = waiting for the slot menu
+void boot_load_hook(void);     // Ishar 3: --skip-intro goes straight to the title screen           // Ishar 3: --lang=fr|en|de|es skips the flag screen

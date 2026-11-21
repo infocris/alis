@@ -24,6 +24,7 @@
 #define ALIS_VM_CORE
 #include "alis.h"
 #include "alis_private.h"
+#include "patches.h"
 #include "audio.h"
 #include "image.h"
 #include "mem.h"
@@ -1379,6 +1380,10 @@ void alis_loop(void)
 #ifndef NDEBUG
         u32 pc_before = alis.script->pc;
 #endif
+        if (boot_load_state)
+            boot_load_hook();
+        if (opt_no_manual_check)
+            manual_check_hook();
         readexec_opcode();
 #ifndef NDEBUG
         if (alis.script->running && alis.state && (alis.script->pc < alis.script->pc_org || alis.script->pc >= alis.script->pc_org + alis.script->data->sz))

@@ -836,9 +836,30 @@ void onot(void)
 }
 
 // Opername no. 54 opcode 0x6a oinkey
+void sys_zqsd_game_poll(void);
+void sys_zqsd_text_poll(void);
+
 void oinkey(void)
 {
     alis.varD7 = alis.automode ? alis.prevkey : (alis.prevkey = io_inkey());
+
+    // ZQSD: letters only become arrows while the main script reads the keyboard
+    // (exploration). Text input (save name, gesort.IO) suspends MAIN.IO.
+    {
+        static void *last_script;
+        static int is_main, is_io;
+        if ((void *)alis.script != last_script)
+        {
+            last_script = alis.script;
+            is_main = alis.script && alis.script->name && strncasecmp(alis.script->name, "main.", 5) == 0;
+            is_io = alis.script && alis.script->name && (strncasecmp(alis.script->name, "io.", 3) == 0
+                    || strncasecmp(alis.script->name, "textin", 6) == 0);   // text input: save name, manual check
+        }
+        if (is_main)
+            sys_zqsd_game_poll();
+        else if (is_io)
+            sys_zqsd_text_poll();   // io.IO disk menu from the keyboard: save name (mouse/gesort always read too)
+    }
     ALIS_DEBUG(EDebugInfo, " [%d] ", alis.varD7);
 }
 
@@ -1049,9 +1070,15 @@ void omodel(void)
 }
 
 // Opername no. 62 opcode 0x7a ogetkey
+extern volatile int sys_text_entry;
 void ogetkey(void)
 {
+    // Blocking wait for a key (typhus.IO: manual check word): typed letters
+    // stay letters (no ZQSD -> arrows, which would also move the party).
+    int was = sys_text_entry;
+    sys_text_entry = 1;
     alis.varD7 = io_getkey();
+    sys_text_entry = was;
     ALIS_DEBUG(EDebugInfo, " [%d] ", alis.varD7);
 }
 

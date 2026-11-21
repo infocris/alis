@@ -1,3 +1,4 @@
+#include <strings.h>
 //
 // Copyright 2023 Olivier Huguenot, Vadim Kindl
 //
@@ -68,6 +69,9 @@ void dirty_add(s16 x, s16 y, u16 w, u16 h)
 
     dirty_rects[dirty_len++] = (rect_t){ .x = x, .y = y, .w = w, .h = h };
 }
+
+int sys_zqsd_sc(int scancode);   // ZQSD = arrows (defined below, SDL2)
+int sys_test_held_sc = -1;       // key held by the ALIS_KEYS test hook (native trace)
 
 #if ALIS_SDL_VER == 1
 
@@ -941,6 +945,22 @@ MIX_RUN(mix_run_s8, s8, (s8)((s16)(s0 + ((s16)buf[bi] << 8)) >> 8))
 #undef MIX_RUN
 #endif
 
+// Adjustable volumes (256 = 100 %): music and sound effects separately.
+// The callback keeps a copy of the buffer after the music; effects are the difference.
+int alis_vol_music = 256, alis_vol_sfx = 256;
+#define kVolSnapLen 32768
+static u16 volsnap[kVolSnapLen];
+static u32 volpeak[2];   // recent music / effects peaks (diagnostics)
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+EMSCRIPTEN_KEEPALIVE void em_set_volume(int music, int sfx)
+{
+    alis_vol_music = music < 0 ? 0 : music > 512 ? 512 : music;
+    alis_vol_sfx = sfx < 0 ? 0 : sfx > 512 ? 512 : sfx;
+}
+EMSCRIPTEN_KEEPALIVE u32 em_vol_peak(int i) { u32 v = volpeak[i & 1]; volpeak[i & 1] = 0; return v; }
+#endif
+
 // MV2 stereo: per-frame right - left music difference
 #define kRDiffLen 4096
 static s32 mrdiff[kRDiffLen];
@@ -1028,6 +1048,10 @@ void sys_audio_callback_S16MSB(void *userdata, u8 *s, s32 buffer_length)
 
     if (audio.muflag == 0)
         audio.working = 0;
+
+    int volmix = (alis_vol_music != 256 || alis_vol_sfx != 256) && buffer_length <= kVolSnapLen;
+    if (volmix)
+        memcpy(volsnap, audio_buffer, buffer_length * 2);
 
     // handle sounds
 
@@ -1300,9 +1324,22 @@ void sys_audio_callback_S16MSB(void *userdata, u8 *s, s32 buffer_length)
     }
 #endif
 
+    if (volmix)
+    {
+        for (int k = 0; k < buffer_length; k++)
+        {
+            s32 m = (s16)volsnap[k];
+            s32 fx = (s16)(u16)(audio_buffer[k] - volsnap[k]);
+            if ((u32)abs(m) > volpeak[0]) volpeak[0] = abs(m);
+            if ((u32)abs(fx) > volpeak[1]) volpeak[1] = abs(fx);
+            s32 v = (m * alis_vol_music + fx * alis_vol_sfx) >> 8;
+            audio_buffer[k] = (u16)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+        }
+    }
+
     for (int f = 0; f < mframes; f++)
     {
-        s32 v = (s16)audio_buffer[f * adv + 1] + mrdiff[f];
+        s32 v = (s16)audio_buffer[f * adv + 1] + (volmix ? mrdiff[f] * alis_vol_music / 256 : mrdiff[f]);
         audio_buffer[f * adv + 1] = (u16)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
     }
 
@@ -1963,7 +2000,7 @@ u8 io_inkey(void)
     if (!currentKeyStates[button.sym])
 #else
     const u8 *currentKeyStates = SDL_GetKeyboardState(NULL);
-    if (!currentKeyStates[button.scancode])
+    if (!currentKeyStates[button.scancode] && !sys_zqsd_sc(button.scancode) && (int)button.scancode != sys_test_held_sc)
 #endif
     {
         button.scancode = 0;
@@ -1973,6 +2010,24 @@ u8 io_inkey(void)
     ALIS_DEBUG(EDebugInfo, " [\"%s\"]", SDL_GetKeyName(button.sym));
     if (alis.platform.uid == EGameRobinsonsRequiem3DO)
         return key3do(button.sym);
+
+    // Ishar 3 PC: START.EXE translates scancodes through its table (file +0x173ab); arrows and
+    // keypad share the scancode, so arrows act as digits ('8' = forward).
+    if (alis.platform.uid == EGameIshar_3 && alis.platform.kind == EPlatformPC)
+    {
+        switch (button.sym)
+        {
+            case SDLK_UP:       return '8';
+            case SDLK_DOWN:     return '2';
+            case SDLK_LEFT:     return '4';
+            case SDLK_RIGHT:    return '6';
+            case SDLK_HOME:     return '7';
+            case SDLK_PAGEUP:   return '9';
+            case SDLK_END:      return '1';
+            case SDLK_PAGEDOWN: return '3';
+            default: break;
+        }
+    }
     
     switch (button.sym)
     {
@@ -2229,16 +2284,16 @@ static u8 sys_joy_compose(int with_mouse_fire, int with_keys)
         if (keys[SDLK_RIGHT] || keys[SDLK_KP6] || keys[SDLK_KP9] || keys[SDLK_KP3])
             a |= 0x08;
 #else
-        if (keys[SDL_SCANCODE_UP]    || keys[SDL_SCANCODE_KP_8] || keys[SDL_SCANCODE_KP_7] || keys[SDL_SCANCODE_KP_9])
+        if ((keys[SDL_SCANCODE_UP] || sys_zqsd_sc(SDL_SCANCODE_UP))    || keys[SDL_SCANCODE_KP_8] || keys[SDL_SCANCODE_KP_7] || keys[SDL_SCANCODE_KP_9])
             a |= 0x01;
         
-        if (keys[SDL_SCANCODE_DOWN]  || keys[SDL_SCANCODE_KP_2] || keys[SDL_SCANCODE_KP_1] || keys[SDL_SCANCODE_KP_3])
+        if ((keys[SDL_SCANCODE_DOWN] || sys_zqsd_sc(SDL_SCANCODE_DOWN))  || keys[SDL_SCANCODE_KP_2] || keys[SDL_SCANCODE_KP_1] || keys[SDL_SCANCODE_KP_3])
             a |= 0x02;
         
-        if (keys[SDL_SCANCODE_LEFT]  || keys[SDL_SCANCODE_KP_4] || keys[SDL_SCANCODE_KP_7] || keys[SDL_SCANCODE_KP_1])
+        if ((keys[SDL_SCANCODE_LEFT] || sys_zqsd_sc(SDL_SCANCODE_LEFT))  || keys[SDL_SCANCODE_KP_4] || keys[SDL_SCANCODE_KP_7] || keys[SDL_SCANCODE_KP_1])
             a |= 0x04;
         
-        if (keys[SDL_SCANCODE_RIGHT] || keys[SDL_SCANCODE_KP_6] || keys[SDL_SCANCODE_KP_9] || keys[SDL_SCANCODE_KP_3])
+        if ((keys[SDL_SCANCODE_RIGHT] || sys_zqsd_sc(SDL_SCANCODE_RIGHT)) || keys[SDL_SCANCODE_KP_6] || keys[SDL_SCANCODE_KP_9] || keys[SDL_SCANCODE_KP_3])
             a |= 0x08;
 #endif
     }
@@ -2256,6 +2311,93 @@ static void sys_joy_refresh(void)
 {
     joystick0 = sys_joy_compose(0, 1);
     joystick1 = sys_joy_compose(1, 1);
+}
+#endif
+
+
+#if !defined(ALIS_USE_NATIVE_ATARI) && ALIS_SDL_VER > 1
+// ZQSD (AZERTY keyboard) = arrows. Z/Q/S/D without Shift become arrows as soon as the SDL
+// event arrives; Shift+letter keeps the letter (text input). zqsd_held[] mirrors the pressed
+// state for state reads (SDL_GetKeyboardState only knows the real key).
+static volatile u8 zqsd_held[4];                    // up, down, left, right
+static const SDL_Scancode zqsd_sc[4] = { SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT };
+static const SDL_Keycode  zqsd_sym[4] = { SDLK_UP, SDLK_DOWN, SDLK_LEFT, SDLK_RIGHT };
+
+static volatile u32 zqsd_main_poll;                // last MAIN.IO oinkey (SDL ms)
+
+void sys_zqsd_game_poll(void)
+{
+    zqsd_main_poll = SDL_GetTicks();
+}
+
+// Milliseconds since MAIN.IO last read the keyboard (the player has control).
+u32 sys_zqsd_main_age(void)
+{
+    return (u32)(SDL_GetTicks() - zqsd_main_poll);
+}
+
+// io.IO reads the keyboard (disk menu, typing the save
+// name; MAIN.IO keeps reading in parallel): the player types text, no remapping.
+static volatile u32 zqsd_text_poll;
+void sys_zqsd_text_poll(void)
+{
+#if !defined(__EMSCRIPTEN__) && !defined(NDEBUG)
+    static u32 last; if (SDL_GetTicks() - last > 1000) { last = SDL_GetTicks(); fprintf(stderr, "\n### TEXT POLL %s at %u\n", alis.script && alis.script->name ? alis.script->name : "?", last); }
+#endif
+    zqsd_text_poll = SDL_GetTicks();
+}
+
+volatile int sys_text_entry;                 // getstring/getval in progress (opcodes.c)
+
+int sys_io_menu_open(void)
+{
+    if (sys_text_entry)
+        return 1;
+    return zqsd_text_poll && (u32)(SDL_GetTicks() - zqsd_text_poll) < 500;
+}
+
+int sys_zqsd_remap(SDL_Keysym *ks, int down)
+{
+    int dir;
+    switch (ks->sym)
+    {
+        case SDLK_z: dir = 0; break;
+        case SDLK_s: dir = 1; break;
+        case SDLK_q: dir = 2; break;
+        case SDLK_d: dir = 3; break;
+        default: return 0;
+    }
+    if (down)
+    {
+        // already converted (repeat): stay on the arrow until release
+        if (!zqsd_held[dir])
+        {
+            if (ks->mod & (KMOD_SHIFT | KMOD_CTRL | KMOD_ALT | KMOD_GUI))
+                return 0;
+            if ((u32)(SDL_GetTicks() - zqsd_main_poll) > 500)
+                return 0;   // the main script is not reading the keyboard: text input, menu...
+            if (sys_io_menu_open())
+                return 0;   // disk menu: save name
+        }
+        zqsd_held[dir] = 1;
+    }
+    else
+    {
+        if (!zqsd_held[dir])
+            return 0;       // press left as a letter: release as a letter too
+        zqsd_held[dir] = 0;
+    }
+    ks->sym = zqsd_sym[dir];
+    ks->scancode = zqsd_sc[dir];
+    return 1;
+}
+
+int sys_zqsd_sc(int scancode)
+{
+    for (int i = 0; i < 4; i++)
+        if (zqsd_sc[i] == scancode)
+            return zqsd_held[i];
+    return 0;
 }
 #endif
 
@@ -2299,7 +2441,7 @@ u8 io_keyon(u8 code)
 #define KDN(sdl2, sdl1) ks[sdl1]
 #else
     const u8 *ks = SDL_GetKeyboardState(NULL);
-#define KDN(sdl2, sdl1) ks[sdl2]
+#define KDN(sdl2, sdl1) (ks[sdl2] || sys_zqsd_sc(sdl2))
 #endif
     switch (code)
     {

@@ -20,6 +20,10 @@
 //
 
 #include "debug.h"
+#include "alis.h"
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
 
 // Before Windows 10, there was no native support for ANSI colors in Windows.
 // But in Windows 10, it requires a special enablement with SetConsoleMode().
@@ -73,11 +77,23 @@ void debug(EDebugLevel level, char * format, ...)
 {
     if((disalis) && (level < EDebugVerbose))
     {
+       // ALIS_TRACE="main,accueil": only trace these scripts (case-insensitive prefix match).
+       static const char *only = (const char *)1;
+       if (only == (const char *)1)
+           only = getenv("ALIS_TRACE");
+       if (only && level == EDebugInfo && alis.script && alis.script->name)
+       {
+           char low[64] = {0};
+           for (int i = 0; i < 63 && alis.script->name[i] && alis.script->name[i] != '.'; i++)
+               low[i] = (char)tolower((unsigned char)alis.script->name[i]);
+           const char *f = strstr(only, low);
+           if (!low[0] || !f || (f[strlen(low)] && f[strlen(low)] != ','))
+               return;
+       }
        va_list arg;
        va_start(arg, format);
-       fflush(stdout);
        vprintf(format, arg);
-       fflush(stdout);
+       va_end(arg);
     }
     else
     {

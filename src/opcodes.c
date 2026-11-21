@@ -5503,6 +5503,8 @@ static void cmouse(void)
     u8 lb_seen = mouse.lb || mouse.lb_clicked;
     u8 rb_seen = mouse.rb || mouse.rb_clicked;
     alis.varD7 = lb_seen ? 1 : (rb_seen ? 2 : 0);
+    if (disalis && alis.varD7)
+        ALIS_DEBUG(EDebugInfo, " [mouse %d,%d button %d] ", mouse.x, mouse.y, alis.varD7);
     cstore_continue();
 }
 
@@ -6951,11 +6953,13 @@ static void cgettime(void)
     cstore_continue();
 }
 
+extern volatile int sys_text_entry;
 void oval(void);
 void getval(void)
 {
     u8 c;
     char *ptr = alis.sd7;
+    sys_text_entry = 1;                 // blocking text input in progress (read by em_text_input)
     while (alis.state && (c = io_getkey()) != '\r')
     {
         if (c == '\b')
@@ -6977,6 +6981,7 @@ void getval(void)
     }
     
     *ptr = 0;
+    sys_text_entry = 0;
     
     oval();
 }
@@ -6993,6 +6998,7 @@ void getstring(void)
 {
     u8 c;
     char *ptr = alis.sd7;
+    sys_text_entry = 1;                 // blocking text input in progress (read by em_text_input)
     while (alis.state && (c = io_getkey()) != '\r')
     {
         if (c == '\b')
@@ -7014,6 +7020,7 @@ void getstring(void)
     }
     
     *ptr = 0;
+    sys_text_entry = 0;
 }
 
 // Codopname no. 178 opcode 0xb1 csinput
