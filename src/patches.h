@@ -33,3 +33,5 @@ void manual_check_hook(void);     // runs before each instruction while --no-man
 extern char opt_load[16];      // Ishar 3: --load=a3 loads that save from the title screen
 extern s32 boot_load_state;    // 1 = waiting for the title menu, 2 = waiting for the slot menu
 void boot_load_hook(void);     // Ishar 3: --skip-intro goes straight to the title screen           // Ishar 3: --lang=fr|en|de|es skips the flag screen
+s32 first_aid_pending(void);     // Ishar 3: em_first_aid() request waiting for frise.IO
+void first_aid_hook(void);       // runs before each instruction while a request waits

@@ -429,3 +429,74 @@ void script_fix(const char *name, u8 *data, u32 data_sz)
         }
     }
 }
+
+
+// First aid without the UI (Ishar 3). frise.IO handles the "Premiers soins" icon of the Act. menu:
+// after the wounded portrait is picked, its routine reads the healer from dir 0x57 and the wounded
+// member from dir 0x59 (party slots 0-4), then applies the game rules: refusal when sympathy
+// main.tc[0x3522][healer][wounded] < 5, once per hit (main.tc[0x35c6][w][w]), success when
+// rnd(100) < skill main.tc[0x3630][healer], heal = max vitality / 10, sympathy changes.
+// em_first_aid(h, w) queues a call to that routine; it runs when frise.IO is back in its idle
+// main loop (where it checks for a click on the panel), as a subroutine returning there.
+static volatile s32 aid_h = -1, aid_w = -1;
+static const u8 aid_sig[] = { 0x4b, 0x00, 0x0d, 0x4b, 0x00, 0x07, 0x07, 0xff, 0xff, 0x00,
+                              0x1f, 0x38, 0x12, 0x59, 0x4c, 0x00, 0xff, 0x3a, 0x14, 0xff, 0xff, 0x00,
+                              0x1f, 0x38, 0x12, 0x59, 0x28, 0xe0, 0x16 };   // 0xff = any byte
+static const u8 idle_sig[] = { 0x1f, 0x38, 0x1e, 0x56, 0x02, 0x4a, 0x00, 0x01, 0x40, 0x20, 0x8e, 0x16,
+                               0x4c, 0x00, 0xfa, 0x42, 0x36, 0x3a, 0x14 };   // main loop: "left click on the panel?"
+static s32 sig_find(const u8 *data, u32 sz, const u8 *sig, u32 len)
+{
+    for (u32 i = 0; i + len <= sz; i++)
+    {
+        u32 k = 0;
+        while (k < len && (sig[k] == 0xff || data[i + k] == sig[k]))
+            k++;
+        if (k == len)
+            return (s32)i;
+    }
+    return -1;
+}
+void first_aid_hook(void)
+{
+    static u32 org, sz;
+    static s32 entry = -1, idle = -1;
+    if (strncasecmp(alis.script->name, "frise", 5))
+        return;
+    sAlisScriptData *d = alis.script->data;
+    if (org != alis.script->pc_org || sz != d->sz)
+    {
+        org = alis.script->pc_org;
+        sz = d->sz;
+        entry = sig_find(alis.mem + org, sz, aid_sig, sizeof(aid_sig));
+        idle = sig_find(alis.mem + org, sz, idle_sig, sizeof(idle_sig));
+        if (entry >= 0)
+            entry += 10;                                // skip the menu erase and the portrait pick
+        ALIS_DEBUG(EDebugInfo, "\n### first aid routine 0x%x, idle loop 0x%x\n", entry, idle);
+    }
+    if (entry < 0 || idle < 0)
+    {
+        aid_h = aid_w = -1;                             // not this release: drop the request
+        return;
+    }
+    if (alis.script->pc - org != (u32)idle)
+        return;
+    xwrite8(alis.script->vram_org + 0x57, (u8)aid_h);
+    xwrite8(alis.script->vram_org + 0x59, (u8)aid_w);
+    xpush32(idle);                                      // cret comes back to the idle loop
+    alis.script->pc = org + entry;
+    aid_h = aid_w = -1;
+}
+s32 first_aid_pending(void) { return aid_w >= 0; }
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// Queue a first aid by party slot (0-4); returns 0 when one is already waiting.
+EMSCRIPTEN_KEEPALIVE int em_first_aid(int h, int w)
+{
+    if (aid_w >= 0 || h < 0 || h > 4 || w < 0 || w > 4 || h == w)
+        return 0;
+    aid_h = h;
+    aid_w = w;
+    return 1;
+}
+EMSCRIPTEN_KEEPALIVE int em_first_aid_pending(void) { return aid_w >= 0; }
+#endif

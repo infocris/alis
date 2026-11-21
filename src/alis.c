@@ -1384,6 +1384,8 @@ void alis_loop(void)
             boot_load_hook();
         if (opt_no_manual_check)
             manual_check_hook();
+        if (first_aid_pending())
+            first_aid_hook();
         readexec_opcode();
 #ifndef NDEBUG
         if (alis.script->running && alis.state && (alis.script->pc < alis.script->pc_org || alis.script->pc >= alis.script->pc_org + alis.script->data->sz))
