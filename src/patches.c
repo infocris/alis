@@ -23,6 +23,7 @@
 
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <stdio.h>
 #include "sys/sys.h"
 #include "alis.h"
@@ -299,18 +300,22 @@ static void script_options(const char *name, u8 *data, u32 data_sz)
             }
 }
 
-// --load=a3: load a save from the title screen, without clicks. One-shot jumps
-// taken by alis_loop() when a script reaches a known instruction:
-//  1. accueil.IO menu loop, "cstore (main.w[0x254] + 5) / 10" (hovered row): jump to the
-//     "Ishar 3" action of the load submenu (clive io.IO; io.b[0x4c] = 1).
-//  2. io.IO slot menu loop, "cstore main.w[0x252] / 80": set loc.b[0x8c4] to the
-//     slot (rank in BACK.INF) and jump to the code run after a click on it
-//     (save name from loc.tp[0x860], file read into MAIN, csend 0x12 to MAIN).
+// Load a save without clicks: --load=a3 at boot, em_load("a3") afterwards (title screen
+// or in game). Any .SAV works, recent (BACK.INF) or not. One-shot jumps taken by
+// alis_loop() when a script reaches a known instruction:
+//  1a. title: accueil.IO menu loop, "cstore (main.w[0x254] + 5) / 10" (hovered row): jump
+//      to the "Ishar 3" action of the load submenu (clive io.IO; io.b[0x4c] = 1).
+//  1b. in game: frise.IO main loop (see first aid): main.w[0x3b56] = 1 (LOAD entry of the
+//      DISK menu) and jump to that entry's action (clive io.IO; io.b[0x4c] = 1).
+//  2.  io.IO slot menu loop, "cstore main.w[0x252] / 80": write the file name to
+//      main.p[0x3b38] and jump past the instruction that copies the clicked slot's name
+//      there (then: file read into MAIN, csend 0x12 to MAIN, which reloads the world).
 char opt_load[16] = {0};
 s32 boot_load_state = 0;
-static s32 boot_slot = -1;
+static char load_file[16];
 static const u8 accueil_btn_le[14] = { 0x1e,0x38,0x20,0x54,0x02,0x56,0x00,0x05,0x5c,0x00,0x0a,0x3a,0x14,0x52 };
 static const u8 accueil_ishar3_le[14] = { 0x40,0x13,0x00,0x08,0x8a,0x01,0x1e,0x00,0x01,0x2a,0x8a,0x01,0x4c,0x00 };
+static const u8 frise_load_le[14] = { 0x40,0x13,0x00,0x08,0x30,0x02,0x1e,0x00,0x01,0x2a,0x30,0x02,0x4c,0x00 };
 static const u8 io_loop_le[12] = { 0x1e,0x38,0x20,0x52,0x02,0x5c,0x00,0x50,0x3a,0x06,0xc2,0x08 };
 static const u8 io_pick_le[12] = { 0x1e,0x38,0x06,0xc4,0x08,0x0c,0x60,0x08,0x3a,0x22,0x38,0x3b };
 
@@ -323,64 +328,73 @@ static s32 find_in_script(const u8 *pat, u32 len)
     return -1;
 }
 
-static s32 back_inf_slot(const char *want)
+// Queue a load ("a3" or "a3.sav"); boot_load_hook() does the rest.
+void load_request(const char *name)
 {
-    char path[kPathMaxLen] = {0};
-    snprintf(path, sizeof(path), "%sBACK.INF", alis.platform.path);
-    FILE *f = sys_fopen(path, "rb");
-    if (!f)
-        return -1;
-    u8 b[14 * 4] = {0};
-    size_t n = fread(b, 1, sizeof(b), f);
-    fclose(f);
-    size_t wl = strlen(want);
-    for (int i = 0; i < 4 && (size_t)(i + 1) * 14 <= n; i++)
-    {
-        const char *e = (const char *)b + i * 14;
-        if (!strncasecmp(e, want, wl) && (e[wl] == 0 || !strncasecmp(e + wl, ".sav", 4)))
-            return i;
-    }
-    return -1;
+    size_t n = 0;
+    for (; name[n] && name[n] != '.' && n < 8; n++)
+        load_file[n] = (char)tolower((unsigned char)name[n]);
+    strcpy(load_file + n, ".sav");
+    boot_load_state = 1;
 }
+
+static s32 frise_idle(void);
 
 void boot_load_hook(void)
 {
     const char *name = alis.script->name;
-    if (boot_load_state == 1 && name && !strncasecmp(name, "accueil", 7))
+    if (!name)
+        return;
+    if (!load_file[0])
+        load_request(opt_load);
+    if (boot_load_state == 1 && !strncasecmp(name, "accueil", 7))
     {
-        static s32 btn = -2, act = -2;
-        if (btn == -2)
+        static u32 org;
+        static s32 btn, act;
+        if (org != alis.script->pc_org)
         {
+            org = alis.script->pc_org;
             btn = find_in_script(accueil_btn_le, sizeof(accueil_btn_le));
             act = find_in_script(accueil_ishar3_le, sizeof(accueil_ishar3_le));
-            boot_slot = back_inf_slot(opt_load);
-            ALIS_DEBUG(EDebugInfo, "\n### boot load: menu 0x%x, action 0x%x, slot %d\n", btn, act, boot_slot);
-            if (btn < 0 || act < 0 || boot_slot < 0)
-            {
-                ALIS_DEBUG(EDebugWarning, "--load=%s: %s\n", opt_load, boot_slot < 0 ? "save not in BACK.INF" : "title menu not recognized");
-                boot_load_state = 0;
-                return;
-            }
+            ALIS_DEBUG(EDebugInfo, "\n### load: title menu 0x%x, action 0x%x\n", btn, act);
         }
-        if ((s32)alis.script->pc == btn)
+        if (btn >= 0 && act >= 0 && (s32)alis.script->pc == btn)
         {
             alis.script->pc = act;
             boot_load_state = 2;
         }
     }
-    else if (boot_load_state == 2 && name && !strncasecmp(name, "io.", 3))
+    else if (boot_load_state == 1 && !strncasecmp(name, "frise", 5))
+    {
+        static u32 org;
+        static s32 act;
+        if (org != alis.script->pc_org)
+        {
+            org = alis.script->pc_org;
+            act = find_in_script(frise_load_le, sizeof(frise_load_le));
+            ALIS_DEBUG(EDebugInfo, "\n### load: DISK menu action 0x%x\n", act);
+        }
+        s32 idle = frise_idle();
+        if (act >= 0 && idle >= 0 && alis.script->pc - alis.script->pc_org == (u32)idle)
+        {
+            xwrite16(alis.basemain + 0x3b56, 1);       // DISK menu entry: LOAD
+            alis.script->pc = act;
+            boot_load_state = 2;
+        }
+    }
+    else if (!strncasecmp(name, "io.", 3))
     {
         // io.IO has this slot loop more than once (load and save menus): act on the one it
-        // is running, and take the first "after click" code that follows it.
+        // is running (also when the player opened it), take the first pick code after it.
         u32 pc = alis.script->pc, end = alis.script->pc_org + alis.script->data->sz;
         if (pc + sizeof(io_loop_le) > end || memcmp(alis.mem + pc, io_loop_le, sizeof(io_loop_le)))
             return;
         for (u32 a = pc; a + sizeof(io_pick_le) <= end && a < pc + 0x200; a++)
             if (!memcmp(alis.mem + a, io_pick_le, sizeof(io_pick_le)))
             {
-                ALIS_DEBUG(EDebugInfo, "\n### boot load: slot loop 0x%x, pick 0x%x\n", pc, a);
-                xwrite8(alis.script->vram_org + 0x8c4, (u8)boot_slot);
-                alis.script->pc = a;
+                ALIS_DEBUG(EDebugInfo, "\n### load %s: slot loop 0x%x, pick 0x%x\n", load_file, pc, a);
+                strcpy((char *)alis.mem + alis.basemain + 0x3b38, load_file);
+                alis.script->pc = a + sizeof(io_pick_le);
                 break;
             }
         boot_load_state = 0;
@@ -487,6 +501,19 @@ void first_aid_hook(void)
     aid_h = aid_w = -1;
 }
 s32 first_aid_pending(void) { return aid_w >= 0; }
+// frise.IO main loop offset (from pc_org), -1 when unknown.
+static s32 frise_idle(void)
+{
+    static u32 org, sz;
+    static s32 idle = -1;
+    if (org != alis.script->pc_org || sz != alis.script->data->sz)
+    {
+        org = alis.script->pc_org;
+        sz = alis.script->data->sz;
+        idle = sig_find(alis.mem + org, sz, idle_sig, sizeof(idle_sig));
+    }
+    return idle;
+}
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 // Queue a first aid by party slot (0-4); returns 0 when one is already waiting.
@@ -499,4 +526,14 @@ EMSCRIPTEN_KEEPALIVE int em_first_aid(int h, int w)
     return 1;
 }
 EMSCRIPTEN_KEEPALIVE int em_first_aid_pending(void) { return aid_w >= 0; }
+// Load a save ("a3"), from the title screen, in game or from the slots screen; 0 while busy.
+EMSCRIPTEN_KEEPALIVE int em_load(const char *name)
+{
+    if (boot_load_state || !name || !name[0])
+        return 0;
+    load_request(name);
+    return 1;
+}
+EMSCRIPTEN_KEEPALIVE int em_load_pending(void) { return boot_load_state; }
+EMSCRIPTEN_KEEPALIVE void em_load_cancel(void) { boot_load_state = 0; }
 #endif
